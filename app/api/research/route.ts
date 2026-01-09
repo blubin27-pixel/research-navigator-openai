@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
-import { searchOpenAlex } from '../../../../utils/openAlex';
-import { searchCrossref } from '../../../../utils/crossref';
-import { searchUnpaywall } from '../../../../utils/unpaywall';
-import { isDisallowed } from '../../../../utils/classifier';
+import { searchOpenAlex } from '../../../utils/openAlex';
+import { searchCrossref } from '../../../utils/crossref';
+import { searchUnpaywall } from '../../../utils/unpaywall';
+import { isDisallowed } from '../../../utils/classifier';
 
 export async function POST(req: Request) {
   try {
@@ -29,7 +29,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // Build search queries (students can copy these into JSTOR or other databases)
+    // Build search queries (students can copy these into JSTOR or other academic databases)
     const baseQuery = topic.trim();
     const searchQueries: string[] = [
       baseQuery,
@@ -44,7 +44,7 @@ export async function POST(req: Request) {
     const openAlexWorks = await searchOpenAlex(baseQuery, maxResults);
 
     // Fetch sources from Crossref
-    let crossrefWorks = [];
+    let crossrefWorks: any[] = [];
     try {
       crossrefWorks = await searchCrossref(baseQuery, maxResults);
     } catch (err) {
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
 
     // Fetch sources from Unpaywall (requires an email). If the email is not provided,
     // skip querying Unpaywall to avoid API errors.
-    let unpaywallWorks = [];
+    let unpaywallWorks: any[] = [];
     const unpaywallEmail = process.env.UNPAYWALL_EMAIL;
     if (unpaywallEmail) {
       try {
@@ -68,25 +68,31 @@ export async function POST(req: Request) {
     // OpenAlex ID as the key to avoid collisions. This merging ensures we don't
     // present duplicate citations from different sources. Each entry collects
     // metadata from all services and accumulates reasons why it is relevant.
-    const mergedMap: Record<string, {
-      title: string;
-      authors: string[];
-      year: number;
-      venue?: string;
-      doi?: string;
-      url?: string;
-      whyRelevantBullets: string[];
-    }> = {};
+    const mergedMap: Record<
+      string,
+      {
+        title: string;
+        authors: string[];
+        year: number;
+        venue?: string;
+        doi?: string;
+        url?: string;
+        whyRelevantBullets: string[];
+      }
+    > = {};
 
-    function upsertEntry(key: string, update: {
-      title?: string;
-      authors?: string[];
-      year?: number;
-      venue?: string;
-      doi?: string;
-      url?: string;
-      whyRelevantBullets?: string[];
-    }) {
+    function upsertEntry(
+      key: string,
+      update: {
+        title?: string;
+        authors?: string[];
+        year?: number;
+        venue?: string;
+        doi?: string;
+        url?: string;
+        whyRelevantBullets?: string[];
+      },
+    ) {
       const existing = mergedMap[key] ?? {
         title: update.title ?? '',
         authors: update.authors ?? [],
@@ -168,9 +174,7 @@ export async function POST(req: Request) {
         venue: work.venue,
         doi: work.doi,
         url: work.url,
-        whyRelevantBullets: [
-          'Open access via Unpaywall',
-        ],
+        whyRelevantBullets: ['Open access via Unpaywall'],
       });
     }
 
@@ -208,8 +212,7 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         decision: 'refuse',
-        refusalReason:
-          'An unexpected error occurred while processing your request.',
+        refusalReason: 'An unexpected error occurred while processing your request.',
       },
       { status: 500 },
     );
