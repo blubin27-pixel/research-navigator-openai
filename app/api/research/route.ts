@@ -81,7 +81,7 @@ export async function POST(req: Request) {
       }
     > = {};
 
-    function upsertEntry(
+    const upsertEntry = (
       key: string,
       update: {
         title?: string;
@@ -92,7 +92,7 @@ export async function POST(req: Request) {
         url?: string;
         whyRelevantBullets?: string[];
       },
-    ) {
+    ) => {
       const existing = mergedMap[key] ?? {
         title: update.title ?? '',
         authors: update.authors ?? [],
@@ -118,7 +118,7 @@ export async function POST(req: Request) {
         }
       }
       mergedMap[key] = existing;
-    }
+    };
 
     // Helper to compute bullet text for authors
     const formatAuthors = (authors: string[]) => {
