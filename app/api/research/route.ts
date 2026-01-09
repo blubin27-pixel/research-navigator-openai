@@ -1,0 +1,217 @@
+import { NextResponse } from 'next/server';
+import { searchOpenAlex } from '../../../../utils/openAlex';
+import { searchCrossref } from '../../../../utils/crossref';
+import { searchUnpaywall } from '../../../../utils/unpaywall';
+import { isDisallowed } from '../../../../utils/classifier';
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const topic = body.topic as string | undefined;
+    const depth = (body.depth as 'quick' | 'deep') || 'quick';
+
+    if (!topic || typeof topic !== 'string') {
+      return NextResponse.json(
+        {
+          decision: 'refuse',
+          refusalReason: 'A valid topic must be provided.',
+        },
+        { status: 400 },
+      );
+    }
+
+    // Check for disallowed writing requests
+    if (isDisallowed(topic)) {
+      return NextResponse.json({
+        decision: 'refuse',
+        refusalReason:
+          'I can’t write content that could be submitted as your assignment. I can help you find sources and build a research plan.',
+      });
+    }
+
+    // Build search queries (students can copy these into JSTOR or other databases)
+    const baseQuery = topic.trim();
+    const searchQueries: string[] = [
+      baseQuery,
+      `${baseQuery} review article`,
+      `${baseQuery} historiography`,
+    ];
+
+    // Determine number of results based on requested depth
+    const maxResults = depth === 'deep' ? 20 : 10;
+
+    // Fetch sources from OpenAlex
+    const openAlexWorks = await searchOpenAlex(baseQuery, maxResults);
+
+    // Fetch sources from Crossref
+    let crossrefWorks = [];
+    try {
+      crossrefWorks = await searchCrossref(baseQuery, maxResults);
+    } catch (err) {
+      // ignore errors silently – we'll still return OpenAlex and other results
+      console.error('Error fetching Crossref results', err);
+    }
+
+    // Fetch sources from Unpaywall (requires an email). If the email is not provided,
+    // skip querying Unpaywall to avoid API errors.
+    let unpaywallWorks = [];
+    const unpaywallEmail = process.env.UNPAYWALL_EMAIL;
+    if (unpaywallEmail) {
+      try {
+        unpaywallWorks = await searchUnpaywall(baseQuery, unpaywallEmail, maxResults);
+      } catch (err) {
+        console.error('Error fetching Unpaywall results', err);
+      }
+    }
+
+    // Merge all results by DOI (case insensitive). For records without a DOI, use the
+    // OpenAlex ID as the key to avoid collisions. This merging ensures we don't
+    // present duplicate citations from different sources. Each entry collects
+    // metadata from all services and accumulates reasons why it is relevant.
+    const mergedMap: Record<string, {
+      title: string;
+      authors: string[];
+      year: number;
+      venue?: string;
+      doi?: string;
+      url?: string;
+      whyRelevantBullets: string[];
+    }> = {};
+
+    function upsertEntry(key: string, update: {
+      title?: string;
+      authors?: string[];
+      year?: number;
+      venue?: string;
+      doi?: string;
+      url?: string;
+      whyRelevantBullets?: string[];
+    }) {
+      const existing = mergedMap[key] ?? {
+        title: update.title ?? '',
+        authors: update.authors ?? [],
+        year: update.year ?? 0,
+        venue: update.venue,
+        doi: update.doi,
+        url: update.url,
+        whyRelevantBullets: [],
+      };
+      // Prefer non-empty fields over empty ones
+      if (!existing.title && update.title) existing.title = update.title;
+      if (existing.authors.length === 0 && update.authors) existing.authors = update.authors;
+      if ((!existing.year || existing.year === 0) && update.year) existing.year = update.year;
+      if (!existing.venue && update.venue) existing.venue = update.venue;
+      if (!existing.doi && update.doi) existing.doi = update.doi;
+      if (!existing.url && update.url) existing.url = update.url;
+      // Append unique bullets, avoiding duplicates
+      if (update.whyRelevantBullets) {
+        for (const bullet of update.whyRelevantBullets) {
+          if (!existing.whyRelevantBullets.includes(bullet)) {
+            existing.whyRelevantBullets.push(bullet);
+          }
+        }
+      }
+      mergedMap[key] = existing;
+    }
+
+    // Helper to compute bullet text for authors
+    const formatAuthors = (authors: string[]) => {
+      return authors && authors.length > 0 ? authors.join(', ') : 'Unknown authors';
+    };
+
+    // Merge OpenAlex results
+    for (const work of openAlexWorks) {
+      const doiKey = work.doi ? work.doi.toLowerCase() : work.id;
+      upsertEntry(doiKey, {
+        title: work.title,
+        authors: work.authors,
+        year: work.publication_year,
+        venue: work.host_venue,
+        doi: work.doi,
+        url: work.doi
+          ? `https://doi.org/${work.doi.replace(/^doi:/, '')}`
+          : work.id,
+        whyRelevantBullets: [
+          `Published in ${work.host_venue ?? 'an unknown venue'} in ${work.publication_year}`,
+          `Authored by ${formatAuthors(work.authors)}`,
+          `Has ${work.cited_by_count} citations on OpenAlex`,
+        ],
+      });
+    }
+
+    // Merge Crossref results
+    for (const work of crossrefWorks) {
+      const doiKey = work.doi ? work.doi.toLowerCase() : work.title;
+      upsertEntry(doiKey, {
+        title: work.title,
+        authors: work.authors,
+        year: work.year,
+        venue: work.venue,
+        doi: work.doi,
+        url: work.url,
+        whyRelevantBullets: [
+          'Recorded in Crossref metadata',
+          work.cited_by_count !== undefined
+            ? `Referenced by ${work.cited_by_count} works in Crossref`
+            : '',
+        ].filter(Boolean),
+      });
+    }
+
+    // Merge Unpaywall results
+    for (const work of unpaywallWorks) {
+      const doiKey = work.doi ? work.doi.toLowerCase() : work.title;
+      upsertEntry(doiKey, {
+        title: work.title,
+        authors: work.authors,
+        year: work.year,
+        venue: work.venue,
+        doi: work.doi,
+        url: work.url,
+        whyRelevantBullets: [
+          'Open access via Unpaywall',
+        ],
+      });
+    }
+
+    // Convert map to array and sort by year descending then by number of bullets (as a proxy for richness)
+    let mergedList = Object.values(mergedMap);
+    mergedList = mergedList.sort((a, b) => {
+      // Sort descending by year
+      if (b.year !== a.year) return (b.year || 0) - (a.year || 0);
+      // Then sort by number of whyRelevant bullets (descending)
+      return (b.whyRelevantBullets.length || 0) - (a.whyRelevantBullets.length || 0);
+    });
+    // Limit results to maxResults
+    const sources = mergedList.slice(0, maxResults);
+
+    // Compose reading order (first few titles)
+    const readingOrder = sources
+      .slice(0, Math.min(5, sources.length))
+      .map((s) => s.title);
+
+    const nextSteps = [
+      'Visit your school library portal and log in.',
+      'Copy and paste the suggested search queries into JSTOR or other academic databases.',
+      'Take notes on key arguments, evidence, and historiographical debates.',
+    ];
+
+    return NextResponse.json({
+      decision: 'allow',
+      searchQueries,
+      sources,
+      readingOrder,
+      nextSteps,
+    });
+  } catch (error) {
+    // Fallback for unhandled errors
+    return NextResponse.json(
+      {
+        decision: 'refuse',
+        refusalReason:
+          'An unexpected error occurred while processing your request.',
+      },
+      { status: 500 },
+    );
+  }
+}
