@@ -56,7 +56,8 @@ export default function ChatPage() {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/history', {
+    const res = await fetch('/api/research', {
+
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic: userText, depth }),
