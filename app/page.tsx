@@ -1,7 +1,10 @@
 'use client';
-import { useState } from 'react';
 
-interface Source {
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+type Role = 'user' | 'assistant';
+
+type Source = {
   title: string;
   authors: string[];
   year: number;
@@ -9,140 +12,247 @@ interface Source {
   doi?: string;
   url: string;
   whyRelevantBullets: string[];
-}
+};
 
-interface Result {
-  decision: 'allow' | 'refuse';
-  refusalReason?: string;
-  searchQueries?: string[];
-  sources?: Source[];
-  readingOrder?: string[];
-  nextSteps?: string[];
-}
+type ApiResult =
+  | { decision: 'refuse'; refusalReason?: string }
+  | {
+      decision: 'allow';
+      searchQueries?: string[];
+      sources?: Source[];
+      readingOrder?: string[];
+      nextSteps?: string[];
+    };
 
-export default function Page() {
-  const [topic, setTopic] = useState('');
+type Message =
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; content: string; data?: ApiResult };
+
+export default function ChatPage() {
+  const [input, setInput] = useState('');
   const [depth, setDepth] = useState<'quick' | 'deep'>('quick');
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      role: 'assistant',
+      content:
+        "Hi — I'm HistoryGPT. Tell me a topic (even vague/short). I’ll find the best places to look and the most credible sources. I won’t write your paper for you.",
+    },
+  ]);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<Result | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  const submit = async () => {
-    if (!topic.trim()) return;
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, loading]);
+
+  const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
+
+  async function send() {
+    if (!canSend) return;
+    const userText = input.trim();
+    setInput('');
+
+    setMessages((m) => [...m, { role: 'user', content: userText }]);
     setLoading(true);
-    setError(null);
-    setResult(null);
+
     try {
-      const res = await fetch('/api/research', {
+      const res = await fetch('/api/history', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic, depth }),
+        body: JSON.stringify({ topic: userText, depth }),
       });
-      const data = await res.json();
-      setResult(data);
-    } catch (err) {
-      setError('Failed to fetch results. Please try again later.');
+      const data: ApiResult = await res.json();
+
+      if (data.decision === 'refuse') {
+        setMessages((m) => [
+          ...m,
+          {
+            role: 'assistant',
+            content:
+              data.refusalReason ??
+              "I can’t help write assignment text. I can find sources and a research plan.",
+            data,
+          },
+        ]);
+      } else {
+        setMessages((m) => [
+          ...m,
+          {
+            role: 'assistant',
+            content: 'Here are the best research directions and sources I found.',
+            data,
+          },
+        ]);
+      }
+    } catch {
+      setMessages((m) => [
+        ...m,
+        {
+          role: 'assistant',
+          content: 'Something went wrong fetching sources. Try again in a moment.',
+        },
+      ]);
     } finally {
       setLoading(false);
     }
-  };
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  }
 
   return (
-    <div className="min-h-screen p-8 bg-gray-50">
-      <h1 className="text-3xl font-bold mb-4">Research Navigator</h1>
-      <div className="mb-4">
-        <input
-          value={topic}
-          onChange={(e) => setTopic(e.target.value)}
-          placeholder="Enter your research topic..."
-          className="w-full p-2 border rounded mb-2"
-        />
-        <select
-          value={depth}
-          onChange={(e) => setDepth(e.target.value as 'quick' | 'deep')}
-          className="p-2 border rounded mr-2"
-        >
-          <option value="quick">Quick (10 sources)</option>
-          <option value="deep">Deep (20 sources)</option>
-        </select>
-        <button
-          onClick={submit}
-          disabled={loading}
-          className="p-2 bg-blue-600 text-white rounded"
-        >
-          {loading ? 'Searching…' : 'Search'}
-        </button>
+    <div className="h-screen flex flex-col">
+      {/* Top bar (mobile) */}
+      <div className="md:hidden border-b border-white/10 bg-[#0a0e17] px-4 py-3">
+        <div className="font-semibold">HistoryGPT</div>
+        <div className="text-xs text-white/60">Research-only assistant</div>
       </div>
-      {error && <p className="text-red-600">{error}</p>}
-      {result && result.decision === 'refuse' && (
-        <div className="p-4 border bg-yellow-100 rounded">
-          <p className="font-semibold">Request Refused</p>
-          <p>{result.refusalReason}</p>
-        </div>
-      )}
-      {result && result.decision === 'allow' && (
-        <div>
-          {result.searchQueries && (
-            <div className="mb-4">
-              <h2 className="text-xl font-semibold">Suggested Search Queries</h2>
-              <ul className="list-disc list-inside">
-                {result.searchQueries.map((q, idx) => (
-                  <li key={idx}>{q}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {result.sources && (
-            <div className="mb-4">
-              <h2 className="text-xl font-semibold">Sources</h2>
-              <div className="space-y-4">
-                {result.sources.map((src, idx) => (
-                  <div key={idx} className="p-4 border rounded bg-white">
-                    <h3 className="font-semibold">{src.title}</h3>
-                    <p className="text-sm text-gray-600">
-                      {src.authors.join(', ')} ({src.year})
-                      {src.venue ? ` – ${src.venue}` : ''}
-                    </p>
-                    <a
-                      href={src.url}
-                      target="_blank"
-                      className="text-blue-600 underline"
-                      rel="noopener noreferrer"
-                    >
-                      {src.doi ?? 'Link'}
-                    </a>
-                    <ul className="list-disc list-inside mt-2">
-                      {src.whyRelevantBullets.map((point, j) => (
-                        <li key={j}>{point}</li>
-                      ))}
-                    </ul>
+
+      {/* Thread */}
+      <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
+        <div className="mx-auto max-w-3xl space-y-5">
+          {messages.map((msg, i) => (
+            <div key={i} className={msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+              <div
+                className={[
+                  'max-w-[90%] rounded-2xl px-4 py-3',
+                  msg.role === 'user'
+                    ? 'bg-[#2563eb] text-white'
+                    : 'bg-white/5 border border-white/10 text-white',
+                ].join(' ')}
+              >
+                <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+
+                {msg.role === 'assistant' && msg.data && msg.data.decision === 'allow' && (
+                  <div className="mt-4 space-y-4">
+                    {msg.data.searchQueries?.length ? (
+                      <Card title="Suggested searches">
+                        <ul className="list-disc list-inside text-white/90">
+                          {msg.data.searchQueries.map((q, idx) => (
+                            <li key={idx}>{q}</li>
+                          ))}
+                        </ul>
+                      </Card>
+                    ) : null}
+
+                    {msg.data.sources?.length ? (
+                      <Card title={`Sources (${msg.data.sources.length})`}>
+                        <div className="space-y-3">
+                          {msg.data.sources.map((s, idx) => (
+                            <div key={idx} className="rounded-xl border border-white/10 bg-black/20 p-3">
+                              <div className="font-semibold">{s.title}</div>
+                              <div className="text-sm text-white/60">
+                                {s.authors?.length ? s.authors.join(', ') : 'Unknown authors'} • {s.year}
+                                {s.venue ? ` • ${s.venue}` : ''}
+                              </div>
+                              <a
+                                href={s.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-sm text-blue-300 hover:underline break-all"
+                              >
+                                {s.doi ?? s.url}
+                              </a>
+                              {!!s.whyRelevantBullets?.length && (
+                                <ul className="mt-2 list-disc list-inside text-sm text-white/85">
+                                  {s.whyRelevantBullets.slice(0, 4).map((b, j) => (
+                                    <li key={j}>{b}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </Card>
+                    ) : null}
+
+                    {msg.data.readingOrder?.length ? (
+                      <Card title="Reading order">
+                        <ol className="list-decimal list-inside text-white/90">
+                          {msg.data.readingOrder.map((t, idx) => (
+                            <li key={idx}>{t}</li>
+                          ))}
+                        </ol>
+                      </Card>
+                    ) : null}
+
+                    {msg.data.nextSteps?.length ? (
+                      <Card title="Next steps">
+                        <ul className="list-disc list-inside text-white/90">
+                          {msg.data.nextSteps.map((t, idx) => (
+                            <li key={idx}>{t}</li>
+                          ))}
+                        </ul>
+                      </Card>
+                    ) : null}
                   </div>
-                ))}
+                )}
+              </div>
+            </div>
+          ))}
+
+          {loading && (
+            <div className="flex justify-start">
+              <div className="max-w-[90%] rounded-2xl px-4 py-3 bg-white/5 border border-white/10 text-white/70">
+                Thinking…
               </div>
             </div>
           )}
-          {result.readingOrder && (
-            <div className="mb-4">
-              <h2 className="text-xl font-semibold">Reading Order</h2>
-              <ol className="list-decimal list-inside">
-                {result.readingOrder.map((title, idx) => (
-                  <li key={idx}>{title}</li>
-                ))}
-              </ol>
-            </div>
-          )}
-          {result.nextSteps && (
-            <div className="mb-4">
-              <h2 className="text-xl font-semibold">Next Steps</h2>
-              <ul className="list-disc list-inside">
-                {result.nextSteps.map((step, idx) => (
-                  <li key={idx}>{step}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+
+          <div ref={bottomRef} />
         </div>
-      )}
+      </div>
+
+      {/* Composer */}
+      <div className="border-t border-white/10 bg-[#0a0e17] px-4 md:px-8 py-4">
+        <div className="mx-auto max-w-3xl">
+          <div className="flex items-end gap-3">
+            <div className="flex-1">
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                rows={2}
+                placeholder="Message HistoryGPT…"
+                className="w-full resize-none rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-white placeholder:text-white/40 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <div className="mt-2 flex items-center gap-2 text-xs text-white/50">
+                <span>Mode:</span>
+                <select
+                  value={depth}
+                  onChange={(e) => setDepth(e.target.value as 'quick' | 'deep')}
+                  className="rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-white"
+                >
+                  <option value="quick">Quick</option>
+                  <option value="deep">Deep</option>
+                </select>
+                <span className="ml-auto">Enter to send • Shift+Enter newline</span>
+              </div>
+            </div>
+
+            <button
+              onClick={send}
+              disabled={!canSend}
+              className="rounded-2xl px-4 py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 transition"
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Card({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+      <div className="text-sm font-semibold text-white/90 mb-2">{title}</div>
+      {children}
     </div>
   );
 }
