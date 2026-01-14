@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import Link from 'next/link';
 
 export const metadata = {
-  title: ''SchoolSafeAI'',
+  title: 'SchoolSafeAI',
     description: 'SchoolSafeAI: research and planning assistant for students with credible sources.',
 };
 
