@@ -1,510 +1,296 @@
-import { NextResponse } from 'next/server';
-import { searchOpenAlex } from '../../../utils/openAlex';
-import { searchCrossref } from '../../../utils/crossref';
-import { searchUnpaywall } from '../../../utils/unpaywall';
-import { isDisallowed } from '../../../utils/classifier';
+import { NextResponse } from "next/server";
+import { isDisallowed } from "../../../utils/classifier";
 
-// For query expansion using OpenAI
+type Depth = "quick" | "deep";
+type ChatMsg = { role: "user" | "assistant"; content: string };
+
+type Source = {
+  title: string;
+  url: string;
+  host: string;
+  year?: number;
+  authors?: string[];
+  whyRelevantBullets: string[];
+};
+
+type Theme = {
+  theme: string;
+  whyThisThemeMatters: string;
+  sources: Source[];
+};
+
+type TopPlace = { name: string; url: string; why: string };
+
+type Allow = {
+  decision: "allow";
+  overview: string;
+  interpretationBullets: string[];
+  topPlaces: TopPlace[];
+  themes: Theme[];
+  nextSteps: string[];
+};
+
+type Refuse = { decision: "refuse"; refusalReason: string };
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-async function generateSearchQueries(topic: string): Promise<string[]> {
-  const baseQuery = topic.trim();
-  // fallback baseline queries
-  const baseline = [
-    baseQuery,
-    `${baseQuery} review article`,
-    `${baseQuery} historiography`,
-  ];
-  if (!OPENAI_API_KEY) return baseline;
+const ALLOWED_HOSTS: RegExp[] = [
+  /\.edu$/i,
+  /arxiv\.org$/i,
+  /osf\.io$/i,
+  /zenodo\.org$/i,
+  /core\.ac\.uk$/i,
+  /semanticscholar\.org$/i,
+  /escholarship\.org$/i,
+  /dash\.harvard\.edu$/i,
+  /stacks\.stanford\.edu$/i,
+  /yalebooks\.yale\.edu$/i,
+];
+
+function hostOf(url: string): string {
   try {
-    const prompt = `You are a research assistant. Given a topic, produce a list of up to 10 concise search queries that students can use to find scholarly sources. Do not include prefixes like "search for" or "query:". Topic: "${topic}"`;
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a helpful research assistant.' },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 0.2,
-        max_tokens: 200,
-        n: 1,
-        stop: null,
-      }),
-    });
-    if (!res.ok) throw new Error('OpenAI API error');
-    const data = await res.json();
-    const message = data.choices?.[0]?.message?.content || '';
-    // assume queries separated by newline or semicolon
-    const queries = message.split(/\n|;/).map((s) => s.trim()).filter(Boolean);
-    return queries.length > 0 ? queries : baseline;
-  } catch (err) {
-    console.error('Error generating queries via OpenAI', err);
-    return baseline;
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
   }
+}
+
+function isPdf(url: string): boolean {
+  const u = url.toLowerCase();
+  return u.endsWith(".pdf") || u.includes(".pdf?") || u.includes("/pdf");
+}
+
+function isAllowedPdf(url: string): boolean {
+  if (!isPdf(url)) return false;
+  const host = hostOf(url);
+  if (!host) return false;
+  return ALLOWED_HOSTS.some((re) => re.test(host));
+}
+
+function dedupeByUrl<T extends { url: string }>(arr: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const x of arr) {
+    const k = (x.url || "").trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
+function compactContext(topic?: string, messages?: ChatMsg[]): string {
+  if (topic?.trim()) return topic.trim();
+  if (!messages?.length) return "";
+  return messages
+    .filter((m) => m.role === "user")
+    .slice(-6)
+    .map((m) => m.content)
+    .join("\n");
+}
+
+async function callOpenAI(userContext: string, depth: Depth): Promise<Allow | Refuse> {
+  if (!OPENAI_API_KEY) {
+    return {
+      decision: "refuse",
+      refusalReason: "Server missing OPENAI_API_KEY.",
+    };
+  }
+
+  const maxThemes = depth === "deep" ? 4 : 3;
+  const maxSourcesPerTheme = depth === "deep" ? 6 : 4;
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      decision: { type: "string", enum: ["allow", "refuse"] },
+      refusalReason: { type: "string" },
+      overview: { type: "string" },
+      interpretationBullets: { type: "array", items: { type: "string" } },
+      topPlaces: {
+        type: "array",
+        minItems: 5,
+        maxItems: 5,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            url: { type: "string" },
+            why: { type: "string" },
+          },
+          required: ["name", "url", "why"],
+        },
+      },
+      themes: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            theme: { type: "string" },
+            whyThisThemeMatters: { type: "string" },
+            sources: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  title: { type: "string" },
+                  url: { type: "string" },
+                  host: { type: "string" },
+                  year: { type: "number" },
+                  authors: { type: "array", items: { type: "string" } },
+                  whyRelevantBullets: { type: "array", items: { type: "string" } },
+                },
+                required: ["title", "url", "host", "whyRelevantBullets"],
+              },
+            },
+          },
+          required: ["theme", "whyThisThemeMatters", "sources"],
+        },
+      },
+      nextSteps: { type: "array", items: { type: "string" } },
+    },
+    required: ["decision"],
+  } as const;
+
+  const system = `
+You are SchoolSafeAI History mode: a ChatGPT-level RESEARCH AGENT (not a keyword search).
+Hard rules:
+- Do NOT write any paper text (no intro, thesis, body, conclusion, or “here’s a paragraph”).
+- If user asks for writing, respond: decision="refuse" with a brief refusalReason.
+
+Goal:
+Understand the user’s intent (even vague/misspelled), then use web search to find ONLY FREE, HIGH-CREDIBILITY ACADEMIC PDF SOURCES.
+Absolute constraints:
+- ONLY direct PDF links.
+- Strongly prefer .edu PDFs (course readers, working papers, lecture notes, institutional repos).
+- Also allow reputable open repositories (arXiv, OSF, Zenodo, CORE, etc.) if needed.
+- NO books for purchase. NO paywalled publishers. NO JSTOR links unless it is a free PDF mirror (must be direct .pdf).
+- No “Crossref metadata” talk. Keep the output clean.
+
+Output format (JSON):
+- overview (short paragraph)
+- interpretationBullets (2–6 bullets showing you understood)
+- topPlaces: exactly 5 best free places to look for THIS topic (URLs + why)
+- themes: ${maxThemes} themes max, each with up to ${maxSourcesPerTheme} sources (direct PDFs only)
+- nextSteps (practical research steps)
+`.trim();
+
+  const user = `
+User prompt/context:
+${userContext}
+
+Return: overview first, then 5 “where to look” sites, then themes with sources grouped under each theme.
+Remember: ONLY direct PDF links from free academic sources.
+`.trim();
+
+  const body = {
+    model: OPENAI_MODEL,
+    tools: [{ type: "web_search_preview" }],
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    temperature: 0.2,
+    max_output_tokens: 1600,
+    text: {
+      format: {
+        type: "json_schema",
+        strict: true,
+        schema,
+      },
+    },
+  };
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await r.text();
+  if (!r.ok) {
+    return { decision: "refuse", refusalReason: `OpenAI error ${r.status}: ${raw.slice(0, 220)}` };
+  }
+
+  let parsed: any;
+  try {
+    const data = JSON.parse(raw);
+    const txt = data.output_text ?? "";
+    parsed = JSON.parse(txt);
+  } catch {
+    return { decision: "refuse", refusalReason: "Could not parse model output." };
+  }
+
+  if (parsed.decision !== "allow") return parsed as Refuse;
+
+  for (const t of parsed.themes ?? []) {
+    t.sources = dedupeByUrl(t.sources || [])
+      .map((s: any) => ({ ...s, host: s.host || hostOf(s.url || "") }))
+      .filter((s: any) => typeof s.url === "string" && isAllowedPdf(s.url))
+      .slice(0, maxSourcesPerTheme);
+  }
+
+  parsed.themes = (parsed.themes || [])
+    .filter((t: any) => Array.isArray(t.sources) && t.sources.length > 0)
+    .slice(0, maxThemes);
+
+  if (!parsed.themes.length) {
+    parsed.nextSteps = [
+      "Try adding a more specific angle + time range (e.g., 'Napoleonic Code civil liberties 1804–1815').",
+      "Ask for 'university lecture notes PDF' or 'working paper PDF' in your prompt.",
+      "Switch to deep mode and re-run.",
+    ];
+  }
+
+  return parsed as Allow;
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const topic = body.topic as string | undefined;
-    const depth = (body.depth as 'quick' | 'deep') || 'quick';
-    if (!topic || typeof topic !== 'string') {
-      return NextResponse.json(
-        { decision: 'refuse', refusalReason: 'A valid topic must be provided.' },
-        { status: 400 },
-      );
+    const depth: Depth = body.depth === "deep" ? "deep" : "quick";
+    const topic: string | undefined = body.topic;
+    const messages: ChatMsg[] | undefined = body.messages;
+
+    const userContext = compactContext(topic, messages);
+    if (!userContext) {
+      return NextResponse.json({ decision: "refuse", refusalReason: "Enter a topic." }, { status: 400 });
     }
 
-    // disallow essay writing
-    if (isDisallowed(topic)) {
+    if (isDisallowed(userContext)) {
       return NextResponse.json({
-        decision: 'refuse',
+        decision: "refuse",
         refusalReason:
-          'I can’t write content that could be submitted as your assignment. I can help you find sources and build a research plan.',
+          "I can’t write any part of your paper. I can help you find free academic PDFs and a research plan.",
       });
     }
 
-    const searchQueries = await generateSearchQueries(topic);
-
-    const maxResults = depth === 'deep' ? 50 : 20;
-
-    const openAlexWorks = await searchOpenAlex(topic, maxResults);
-    let crossrefWorks: any[] = [];
-    try {
-      crossrefWorks = await searchCrossref(topic, maxResults);
-    } catch (err) {
-      console.error('Error fetching Crossref results', err);
-    }
-    let unpaywallWorks: any[] = [];
-    const unpaywallEmail = process.env.UNPAYWALL_EMAIL;
-    if (unpaywallEmail) {
-      try {
-        unpaywallWorks = await searchUnpaywall(topic, unpaywallEmail, maxResults);
-      } catch (err) {
-        console.error('Error fetching Unpaywall results', err);
-      }
-    }
-
-    const mergedMap: Record<
-      string,
-      {
-        title: string;
-        authors: string[];
-        year: number;
-        venue?: string;
-        doi?: string;
-        url?: string;
-        whyRelevantBullets: string[];
-      }
-    > = {};
-
-    const upsertEntry = (
-      key: string,
-      update: {
-        title?: string;
-        authors?: string[];
-        year?: number;
-        venue?: string;
-        doi?: string;
-        url?: string;
-        whyRelevantBullets?: string[];
-      },
-    ) => {
-      const existing =
-        mergedMap[key] ??
-        ({
-          title: update.title ?? '',
-          authors: update.authors ?? [],
-          year: update.year ?? 0,
-          venue: update.venue,
-          doi: update.doi,
-          url: update.url,
-          whyRelevantBullets: [],
-        } as {
-          title: string;
-          authors: string[];
-          year: number;
-          venue?: string;
-          doi?: string;
-          url?: string;
-          whyRelevantBullets: string[];
-        });
-
-      if (!existing.title && update.title) existing.title = update.title;
-      if (existing.authors.length === 0 && update.authors) existing.authors = update.authors;
-      if ((!existing.year || existing.year === 0) && update.year) existing.year = update.year;
-      if (!existing.venue && update.venue) existing.venue = update.venue;
-      if (!existing.doi && update.doi) existing.doi = update.doi;
-      if (!existing.url && update.url) existing.url = update.url;
-      if (update.whyRelevantBullets) {
-        for (const bullet of update.whyRelevantBullets) {
-          if (!existing.whyRelevantBullets.includes(bullet)) {
-            existing.whyRelevantBullets.push(bullet);
-          }
-        }
-      }
-      mergedMap[key] = existing;
-    };
-
-    // format authors
-    const formatAuthors = (authors: string[]) => {
-      return authors && authors.length > 0 ? authors.join(', ') : 'Unknown authors';
-    };
-
-    // Merge openAlex results
-    for (const work of openAlexWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.id;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.publication_year,
-        venue: work.host_venue,
-        doi: work.doi,
-        url: work.doi ? `https://doi.org/${work.doi.replace(/^doi:/, '')}` : work.id,
-        whyRelevantBullets: [
-          `Published in ${work.host_venue ?? 'an unknown venue'} in ${work.publication_year}`,
-          `Authored by ${formatAuthors(work.authors)}`,
-          `Has ${work.cited_by_count} citations on OpenAlex`,
-        ],
-      });
-    }
-
-    // Merge crossref results
-    for (const work of crossrefWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.title;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.year,
-        venue: work.venue,
-        doi: work.doi,
-        url: work.url,
-        whyRelevantBullets: [
-          'Recorded in Crossref metadata',
-          work.cited_by_count !== undefined
-            ? `Referenced by ${work.cited_by_count} works in Crossref`
-            : '',
-        ].filter(Boolean),
-      });
-    }
-
-    // merge unpaywall results
-    for (const work of unpaywallWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.title;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.year,
-        venue: work.venue,
-        doi: work.doi,
-        url: work.url,
-        whyRelevantBullets: ['Open access via Unpaywall'],
-      });
-    }
-
-    let mergedList = Object.values(mergedMap);
-    mergedList = mergedList
-      .filter((s) => s.title && s.authors)
-      .sort((a, b) => {
-        if ((b.year || 0) !== (a.year || 0)) return (b.year || 0) - (a.year || 0);
-        return (b.whyRelevantBullets.length || 0) - (a.whyRelevantBullets.length || 0);
-      });
-
-    const sources = mergedList.slice(0, maxResults);
-    const readingOrder = sources.slice(0, Math.min(5, sources.length)).map((s) => s.title);
-    const nextSteps = [
-      'Visit your school library portal and log in.',
-      'Copy and paste the suggested search queries into JSTOR or other academic databases.',
-      'Take notes on key arguments, evidence, and historiographical debates.',
-    ];
-
-import { NextResponse } from 'next/server';
-import { searchOpenAlex } from '../../../utils/openAlex';
-import { searchCrossref } from '../../../utils/crossref';
-import { searchUnpaywall } from '../../../utils/unpaywall';
-import { isDisallowed } from '../../../utils/classifier';
-
-// For query expansion using OpenAI
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
-
-async function generateSearchQueries(topic: string): Promise<string[]> {
-  const baseQuery = topic.trim();
-  // fallback baseline queries
-  const baseline = [
-    baseQuery,
-    `${baseQuery} review article`,
-    `${baseQuery} historiography`,
-  ];
-  if (!OPENAI_API_KEY) return baseline;
-  try {
-    const prompt = `You are a research assistant. Given a topic, produce a list of up to 10 concise search queries that students can use to find scholarly sources. Do not include prefixes like "search for" or "query:". Topic: "${topic}"`;
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a helpful research assistant.' },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 0.2,
-        max_tokens: 200,
-        n: 1,
-        stop: null,
-      }),
-    });
-    if (!res.ok) throw new Error('OpenAI API error');
-    const data = await res.json();
-    const message = data.choices?.[0]?.message?.content || '';
-    // assume queries separated by newline or semicolon
-    const queries = message.split(/\n|;/).map((s) => s.trim()).filter(Boolean);
-    return queries.length > 0 ? queries : baseline;
-  } catch (err) {
-    console.error('Error generating queries via OpenAI', err);
-    return baseline;
-  }
-}
-
-export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    const topic = body.topic as string | undefined;
-    const depth = (body.depth as 'quick' | 'deep') || 'quick';
-    if (!topic || typeof topic !== 'string') {
-      return NextResponse.json(
-        { decision: 'refuse', refusalReason: 'A valid topic must be provided.' },
-        { status: 400 },
-      );
-    }
-
-    // disallow essay writing
-    if (isDisallowed(topic)) {
-      return NextResponse.json({
-        decision: 'refuse',
-        refusalReason:
-          'I can’t write content that could be submitted as your assignment. I can help you find sources and build a research plan.',
-      });
-    }
-
-    const searchQueries = await generateSearchQueries(topic);
-
-    const maxResults = depth === 'deep' ? 50 : 20;
-
-    const openAlexWorks = await searchOpenAlex(topic, maxResults);
-    let crossrefWorks: any[] = [];
-    try {
-      crossrefWorks = await searchCrossref(topic, maxResults);
-    } catch (err) {
-      console.error('Error fetching Crossref results', err);
-    }
-    let unpaywallWorks: any[] = [];
-    const unpaywallEmail = process.env.UNPAYWALL_EMAIL;
-    if (unpaywallEmail) {
-      try {
-        unpaywallWorks = await searchUnpaywall(topic, unpaywallEmail, maxResults);
-      } catch (err) {
-        console.error('Error fetching Unpaywall results', err);
-      }
-    }
-
-    const mergedMap: Record<
-      string,
-      {
-        title: string;
-        authors: string[];
-        year: number;
-        venue?: string;
-        doi?: string;
-        url?: string;
-        whyRelevantBullets: string[];
-      }
-    > = {};
-
-    const upsertEntry = (
-      key: string,
-      update: {
-        title?: string;
-        authors?: string[];
-        year?: number;
-        venue?: string;
-        doi?: string;
-        url?: string;
-        whyRelevantBullets?: string[];
-      },
-    ) => {
-      const existing =
-        mergedMap[key] ??
-        ({
-          title: update.title ?? '',
-          authors: update.authors ?? [],
-          year: update.year ?? 0,
-          venue: update.venue,
-          doi: update.doi,
-          url: update.url,
-          whyRelevantBullets: [],
-        } as {
-          title: string;
-          authors: string[];
-          year: number;
-          venue?: string;
-          doi?: string;
-          url?: string;
-          whyRelevantBullets: string[];
-        });
-
-      if (!existing.title && update.title) existing.title = update.title;
-      if (existing.authors.length === 0 && update.authors) existing.authors = update.authors;
-      if ((!existing.year || existing.year === 0) && update.year) existing.year = update.year;
-      if (!existing.venue && update.venue) existing.venue = update.venue;
-      if (!existing.doi && update.doi) existing.doi = update.doi;
-      if (!existing.url && update.url) existing.url = update.url;
-      if (update.whyRelevantBullets) {
-        for (const bullet of update.whyRelevantBullets) {
-          if (!existing.whyRelevantBullets.includes(bullet)) {
-            existing.whyRelevantBullets.push(bullet);
-          }
-        }
-      }
-      mergedMap[key] = existing;
-    };
-
-    // format authors
-    const formatAuthors = (authors: string[]) => {
-      return authors && authors.length > 0 ? authors.join(', ') : 'Unknown authors';
-    };
-
-    // Merge openAlex results
-    for (const work of openAlexWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.id;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.publication_year,
-        venue: work.host_venue,
-        doi: work.doi,
-        url: work.doi ? `https://doi.org/${work.doi.replace(/^doi:/, '')}` : work.id,
-        whyRelevantBullets: [
-          `Published in ${work.host_venue ?? 'an unknown venue'} in ${work.publication_year}`,
-          `Authored by ${formatAuthors(work.authors)}`,
-          `Has ${work.cited_by_count} citations on OpenAlex`,
-        ],
-      });
-    }
-
-    // Merge crossref results
-    for (const work of crossrefWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.title;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.year,
-        venue: work.venue,
-        doi: work.doi,
-        url: work.url,
-        whyRelevantBullets: [
-          'Recorded in Crossref metadata',
-          work.cited_by_count !== undefined
-            ? `Referenced by ${work.cited_by_count} works in Crossref`
-            : '',
-        ].filter(Boolean),
-      });
-    }
-
-    // merge unpaywall results
-    for (const work of unpaywallWorks) {
-      const key = work.doi ? work.doi.toLowerCase() : work.title;
-      upsertEntry(key, {
-        title: work.title,
-        authors: work.authors,
-        year: work.year,
-        venue: work.venue,
-        doi: work.doi,
-        url: work.url,
-        whyRelevantBullets: ['Open access via Unpaywall'],
-      });
-    }
-
-    let mergedList = Object.values(mergedMap);
-    mergedList = mergedList
-      .filter((s) => s.title && s.authors)
-      .sort((a, b) => {
-        if ((b.year || 0) !== (a.year || 0)) return (b.year || 0) - (a.year || 0);
-        return (b.whyRelevantBullets.length || 0) - (a.whyRelevantBullets.length || 0);
-      });
-
-    const sources = mergedList.slice(0, maxResults);
-    const readingOrder = sources.slice(0, Math.min(5, sources.length)).map((s) => s.title);
-    const nextSteps = [
-      'Visit your school library portal and log in.',
-      'Copy and paste the suggested search queries into JSTOR or other academic databases.',
-      'Take notes on key arguments, evidence, and historiographical debates.',
-    ];
-
-    return NextResponse.json({
-      decision: 'allow',
-      searchQueries,
-      sources,
-      readingOrder,
-      nextSteps,
-    });
-  } catch (error) {
-    console.error('Error in history route', error);
+    const out = await callOpenAI(userContext, depth);
+    return NextResponse.json(out);
+  } catch (e: any) {
     return NextResponse.json(
-      { decision: 'refuse', refusalReason: 'An unexpected error occurred.' },
+      { decision: "refuse", refusalReason: `Server error: ${e?.message ?? "unknown"}` },
       { status: 500 },
     );
   }
 }
 
-// Provide GET support
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const topic = url.searchParams.get('topic');
-  const depth = (url.searchParams.get('depth') as 'quick' | 'deep') || 'quick';
-  const body = JSON.stringify({ topic, depth });
-  const fakeReq = new Request(req.url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
+  const topic = url.searchParams.get("topic") || "";
+  const depth = (url.searchParams.get("depth") as Depth) || "quick";
+  const fake = new Request(req.url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ topic, depth }),
   });
-  return POST(fakeReq);
-}
-    return NextResponse.json({
-      decision: 'allow',
-      searchQueries,
-      sources,
-      readingOrder,
-      nextSteps,
-    });
-  } catch (error) {
-    console.error('Error in history route', error);
-    return NextResponse.json(
-      { decision: 'refuse', refusalReason: 'An unexpected error occurred.' },
-      { status: 500 },
-    );
-  }
-}
-
-// Provide GET support
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const topic = url.searchParams.get('topic');
-  const depth = (url.searchParams.get('depth') as 'quick' | 'deep') || 'quick';
-  const body = JSON.stringify({ topic, depth });
-  const fakeReq = new Request(req.url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  });
-  return POST(fakeReq);
+  return POST(fake);
 }
